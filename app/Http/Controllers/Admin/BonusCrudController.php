@@ -58,7 +58,13 @@ class BonusCrudController extends CrudController
                 'type'      => 'select',
                 'entity'    => 'stall',
                 'model'     => "App\Models\Stall",
-                'attribute' => 'num'
+                'attribute' => 'id_num',
+                'searchLogic' => function ($query, $column, $searchTerm) {
+                    $query->orWhereHas('stall', function ($q) use ($searchTerm) {
+                        $q->where('num', 'like', '%' . $searchTerm . '%')
+                            ->orWhere('stalls.id', 'like', '%' . $searchTerm . '%');
+                    });
+                },
             ],
             [
                 'name'      => 'market_id',
@@ -142,7 +148,7 @@ class BonusCrudController extends CrudController
                 'entity'    => 'stall',
                 'model'     => "App\Models\Stall",
                 'attribute' => 'num_market_active_titular',
-                'allows_null' => true
+                'allows_null' => true,
             ],
             [
                 'name' => 'start_at',

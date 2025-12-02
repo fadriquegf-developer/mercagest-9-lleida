@@ -43,7 +43,7 @@ class Stall extends Model
         'n_zones',
         'visible'
     ];
-    protected $appends = ['titular', 'titular_id', 'titular_info', 'from', 'to', 'num_market'];
+    protected $appends = ['titular', 'titular_id', 'titular_info', 'from', 'to', 'num_market', 'id_num'];
 
     /*
     |--------------------------------------------------------------------------
@@ -162,7 +162,7 @@ class Stall extends Model
         $price_without_discount = $this->getPriceByDateRangeWithoutDiscount($from, $to, $days);
 
         $price_with_discount = $this->getPriceByDateRangeWithDiscount($from, $to, $days);
-        
+
         $subtotal = $price_without_discount - $price_with_discount;
 
         //Creamos solo si hay bonuses
@@ -235,7 +235,7 @@ class Stall extends Model
             //Miramos el tipo de tarifa, si es por dia, o fija
             if ($this->rate->rate_type == 'daily') {
                 foreach ($days as $day) {
-                    $total -= $this->getPriceForDate($bonuses, $day, $price);
+                    $total += $this->getPriceForDate($bonuses, $day, $price, count($days));
                 }
             } else {
                 //La tarifa es fija, no se tiene en cuenta el numero de dias
@@ -259,13 +259,20 @@ class Stall extends Model
         return $total;
     }
 
-    public function getPriceForDate($bonuses, $date, $price)
+    public function getPriceForDate($bonuses, $date, $price, $market_days = null)
     {
-        $filter_bonuses = $bonuses->filterByDate($date)->get();
+        $filter_bonuses = $bonuses->filter(function ($bonus) use ($date) {
+            return $bonus->start_at <= $date->date && $bonus->ends_at >= $date->date;
+        });
+
         $result = $price;
         if ($filter_bonuses->count()) {
             foreach ($filter_bonuses as $bonus) {
-                $result -= $bonus->getPriceChanged($price);
+                $descuento = $bonus->getPriceChanged($result, $market_days);
+                $result -= $descuento;
+                if ($result < 0) {
+                    $result = 0;
+                }
             }
         }
         return $result;
@@ -590,13 +597,29 @@ class Stall extends Model
         return $this->num . ' (' . $this->market_name . ')';
     }
 
+    public function getIdNumAttribute()
+    {
+       return $this->num . ' (#' . $this->id . ')';
+    }
+
     public function getNumMarketActiveTitularAttribute()
     {
-        if ($this->historicals->count() > 0) {
-            return $this->num_market . ' - ' . $this->historicals->last()->name;
+        $result = '[#' . $this->id . '] ' . $this->num_market;
+
+        // Forzar a obtener el valor raw del atributo
+        $visibleValue = $this->getAttributes()['visible'] ?? 1;
+
+        if ($visibleValue == 0) {
+            $result .= ' [OCULTA]';
         }
 
-        //return $this->num_market . ' - Sense titular';
+        if ($this->historicals->count() > 0) {
+            $result .= ' - ' . $this->historicals->last()->name;
+        } else {
+            $result .= ' - Sense titular';
+        }
+
+        return $result;
     }
 
     /*
