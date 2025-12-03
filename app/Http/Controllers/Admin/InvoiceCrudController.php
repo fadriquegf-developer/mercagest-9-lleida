@@ -7,6 +7,7 @@ use App\Models\BicConversion;
 use App\Models\Calendar;
 use App\Models\Invoice;
 use App\Models\InvoiceConcept;
+use App\Models\Market;
 use App\Models\MarketGroup;
 use App\Models\Person;
 use Backpack\CRUD\app\Http\Controllers\CrudController;
@@ -40,8 +41,36 @@ class InvoiceCrudController extends CrudController
     }
     use \App\Traits\AdminPermissions;
 
-    // *** Cache per als dies del calendari ***
+    /**
+     * Cache de dies de calendari per market
+     * Format: [market_id => Collection of Calendar days]
+     */
     private $calendarCache = [];
+
+    /**
+     * Cache de rates per stall
+     */
+    private $rateCache = [];
+
+    /**
+     * Concepts pendents d'inserir (batch insert)
+     */
+    private $conceptsToInsert = [];
+
+    /**
+     * IDs d'invoices a eliminar (batch delete)
+     */
+    private $invoicesToDelete = [];
+
+    /**
+     * Mida del batch per inserts
+     */
+    private const BATCH_SIZE = 100;
+
+    /**
+     * Mida del chunk per processar persones
+     */
+    private const CHUNK_SIZE = 50;
 
     /**
      * Configure the CrudPanel object. Apply settings to all operations.
@@ -423,122 +452,117 @@ class InvoiceCrudController extends CrudController
     }
 
     /**
-     * *** OPTIMITZAT ***
-     * 
-     * Genera invoices de forma optimitzada utilitzant:
-     * - Chunking per processar en grups petits
-     * - Eager loading per evitar N+1
-     * - Cache de calendari
-     * - Gestió de memòria millorada
+     * Genera els invoices - VERSIÓ OPTIMITZADA
      */
     public function generate_index_invoice(Request $request)
     {
-        // Validació
+        // Validació d'edició especial
         if ($request->especial_edition) {
             $validator = Validator::make($request->all(), [
                 'liquidation_days' => 'required|integer|min:1',
             ], [
                 'liquidation_days.required' => 'Has d\'indicar un nombre de dies per a l\'edició especial.',
-                'liquidation_days.integer'  => 'El nombre de dies ha de ser un valor enter.',
-                'liquidation_days.min'      => 'El nombre de dies ha de ser superior a 0.',
+                'liquidation_days.integer' => 'El nombre de dies ha de ser un valor enter.',
+                'liquidation_days.min' => 'El nombre de dies ha de ser superior a 0.',
             ]);
 
             if ($validator->fails()) {
-                return redirect()->back()
-                    ->withErrors($validator)
-                    ->withInput();
+                return redirect()->back()->withErrors($validator)->withInput();
             }
         }
 
         $years = $request->years;
-        $market_group_id = $request->marketgroup_id;
-        $especialEdition = $request->especial_edition ?? 0;
+        $marketGroupId = $request->marketgroup_id;
+        $especialEdition = $request->especial_edition ?? false;
         $liquidationDays = $especialEdition ? $request->liquidation_days : null;
 
-        // Eliminem invoices provisionals
-        $this->deleteExpired();
+        // Calcular rang de dates
+        $month = null;
+        $trimestral = null;
 
-        // Determinem el rang de dates
         if ($request->trimestral) {
             $trimestral = $request->trimestral;
-            switch ($trimestral) {
-                case '1':
-                    $from = \Carbon\Carbon::create($years, 1)->firstOfMonth()->toDateString();
-                    $to = \Carbon\Carbon::create($years, 3)->lastOfMonth()->toDateString();
-                    break;
-                case '2':
-                    $from = \Carbon\Carbon::create($years, 4)->firstOfMonth()->toDateString();
-                    $to = \Carbon\Carbon::create($years, 6)->lastOfMonth()->toDateString();
-                    break;
-                case '3':
-                    $from = \Carbon\Carbon::create($years, 7)->firstOfMonth()->toDateString();
-                    $to = \Carbon\Carbon::create($years, 9)->lastOfMonth()->toDateString();
-                    break;
-                case '4':
-                    $from = \Carbon\Carbon::create($years, 10)->firstOfMonth()->toDateString();
-                    $to = \Carbon\Carbon::create($years, 12)->lastOfMonth()->toDateString();
-                    break;
-            }
+            $ranges = [
+                '1' => [1, 3],
+                '2' => [4, 6],
+                '3' => [7, 9],
+                '4' => [10, 12]
+            ];
+            $range = $ranges[$trimestral];
+            $from = \Carbon\Carbon::create($years, $range[0])->firstOfMonth()->toDateString();
+            $to = \Carbon\Carbon::create($years, $range[1])->lastOfMonth()->toDateString();
         } else {
             $month = $request->month;
             $from = \Carbon\Carbon::create($years, $month)->firstOfMonth()->toDateString();
             $to = \Carbon\Carbon::create($years, $month)->lastOfMonth()->toDateString();
         }
 
+        // Inicialitzar arrays
         $invoices = [];
-        $chunkSize = 50; // *** Processar en chunks de 50 ***
+        $this->invoicesToDelete = [];
+        $this->conceptsToInsert = [];
         $processedCount = 0;
 
-        // *** Eager Loading per evitar N+1 ***
-        Person::whereHas('historicals', function ($query) use ($market_group_id, $from, $to) {
-            $query->activeTitular()
-                ->orWhere(function ($query) use ($from, $to) {
-                    $query->whereDate('ends_at', '>=', $from)
-                        ->whereDate('ends_at', '<=', $to);
-                })
-                ->where('market_group_id', $market_group_id)
-                ->whereHas('market', function ($market) {
-                    $market->where('status', 1);
-                });
-        })
-            ->with([
-                'historicals' => function ($query) use ($from, $to, $market_group_id) {
-                    $query->where(function ($q) use ($from, $to) {
-                        $q->where('end_vigencia', null)
-                            ->orWhere('end_vigencia', '>=', $from);
+        // OPTIMITZACIÓ 1: Eliminar invoices provisionals (status 0) d'una vegada
+        // IMPORTANT: Això s'executa FORA de la transacció
+        $this->deleteExpiredOptimized();
+
+        // Utilitzar transacció per a les operacions de INSERT/UPDATE
+        // NOTA: NO incloure refreshDB (ALTER TABLE) dins - fa commit implícit
+        DB::transaction(function () use (
+            $from,
+            $to,
+            $marketGroupId,
+            $especialEdition,
+            $liquidationDays,
+            $years,
+            $month,
+            $trimestral,
+            &$invoices,
+            &$processedCount
+        ) {
+            // OPTIMITZACIÓ 2: Pre-carregar calendari UNA vegada
+            $this->preloadCalendar($marketGroupId, $from, $to);
+
+            // Query de persones (LÒGICA ORIGINAL simplificada)
+            // L'eager loading s'ha eliminat perquè causava problemes
+            // Els stalls es carreguen dins de processPersonInvoice
+            $personsQuery = Person::whereHas('historicals', function ($query) use ($marketGroupId, $from, $to) {
+                $query->activeTitular()
+                    ->orWhere(function ($query) use ($from, $to) {
+                        $query->whereDate('ends_at', '>=', $from)
+                            ->whereDate('ends_at', '<=', $to);
                     })
-                        ->where('market_group_id', $market_group_id);
-                },
-                'historicals.market',
-                'historicals.rate',
-                'historicals.classe',
-                'historicals.bonuses' => function ($query) use ($from, $to) {
-                    $query->filterByDateRange($from, $to);
-                }
-            ])
-            ->orderBy('name', 'ASC')
-            ->chunk($chunkSize, function ($persons) use (
+                    ->where('market_group_id', $marketGroupId)
+                    ->whereHas('market', function ($market) {
+                        $market->where('status', 1);
+                    });
+            })->orderBy('name', 'ASC');
+
+            // OPTIMITZACIÓ 4: Processar en chunks
+            $personsQuery->chunk(self::CHUNK_SIZE, function ($persons) use (
                 $from,
                 $to,
-                $market_group_id,
+                $marketGroupId,
                 $especialEdition,
                 $liquidationDays,
                 $years,
+                $month,
+                $trimestral,
                 &$invoices,
-                &$processedCount,
-                $request
+                &$processedCount
             ) {
                 foreach ($persons as $person) {
-                    // *** Mètode separat per processar cada persona ***
                     $invoice = $this->processPersonInvoice(
                         $person,
                         $from,
                         $to,
-                        $market_group_id,
+                        $marketGroupId,
                         $especialEdition,
                         $liquidationDays,
                         $years,
-                        $request
+                        $month,
+                        $trimestral
                     );
 
                     if ($invoice) {
@@ -546,80 +570,196 @@ class InvoiceCrudController extends CrudController
                     }
 
                     $processedCount++;
-
-                    // Forçar garbage collection cada 20 persones
-                    if ($processedCount % 20 === 0) {
-                        gc_collect_cycles();
-                    }
                 }
+
+                // OPTIMITZACIÓ 6: Garbage collection
+                gc_collect_cycles();
             });
 
-        // Netegem el cache al final
-        $this->calendarCache = [];
-        gc_collect_cycles();
+            // OPTIMITZACIÓ 8: Eliminar invoices buits en batch
+            if (!empty($this->invoicesToDelete)) {
+                // Eliminar concepts associats
+                InvoiceConcept::whereIn('invoice_id', $this->invoicesToDelete)->delete();
+                // Eliminar invoices
+                Invoice::whereIn('id', $this->invoicesToDelete)->delete();
+            }
+        }); // Fi de la transacció
+
+        // OPTIMITZACIÓ 9: UN ÚNIC refreshDB al final
+        // IMPORTANT: Això s'executa FORA de la transacció perquè ALTER TABLE fa commit implícit
+        $this->refreshDB();
+
+        // Recarregar invoices amb les seves relacions per a la vista
+        $invoiceIds = collect($invoices)->pluck('id')->toArray();
+        $invoices = Invoice::with(['person', 'concepts.stall.market', 'concepts.stall.classe', 'market_group'])
+            ->whereIn('id', $invoiceIds)
+            ->get();
 
         $crud = $this->crud;
         return view('admin.invoice.index_invoice_gtt', compact('invoices', 'crud'));
     }
 
     /**
-     * *** Mètode privat per processar cada persona ***
-     * 
-     * Extreu la lògica de generació d'invoices a un mètode separat
-     * per facilitar la gestió de memòria i el manteniment del codi
+     * Afegeix un concept al batch per inserir després
+     */
+    private function addConceptToBatch(array $conceptData): void
+    {
+        $conceptData['created_at'] = now();
+        $conceptData['updated_at'] = now();
+        $this->conceptsToInsert[] = $conceptData;
+
+        // Inserir quan arribem al límit del batch
+        if (count($this->conceptsToInsert) >= self::BATCH_SIZE) {
+            $this->flushConceptsBatch();
+        }
+    }
+
+    /**
+     * Insereix tots els concepts pendents
+     */
+    private function flushConceptsBatch(): void
+    {
+        if (!empty($this->conceptsToInsert)) {
+            InvoiceConcept::insert($this->conceptsToInsert);
+            $this->conceptsToInsert = [];
+        }
+    }
+
+    /**
+     * Genera el concepte de stall i retorna el subtotal
+     * OPTIMITZACIÓ: Utilitza addConceptToBatch en lloc de create()
+     */
+    private function generateStallConceptOptimized($stall, $days, $invoiceId, $stallId): float
+    {
+        $price = $stall->getCalculatedPrice();
+        $subtotal = 0;
+
+        if ($stall->rate->rate_type == 'daily') {
+            $subtotal = $price * $days->count();
+        } else {
+            $subtotal = $price;
+        }
+
+        $this->addConceptToBatch([
+            'invoice_id' => $invoiceId,
+            'stall_id' => $stallId,
+            'concept' => 'stall',
+            'concept_type' => $stall->rate->price_type,
+            'type_rate' => $stall->rate->rate_type,
+            'length' => $stall->length,
+            'qty_days' => $days->count(),
+            'price' => $stall->rate->price,
+            'subtotal' => $subtotal
+        ]);
+
+        return $subtotal;
+    }
+
+    /**
+     * Genera el concepte de despeses i retorna el subtotal
+     */
+    private function generateExpensesConceptOptimized($stall, $days, $invoiceId, $stallId): float
+    {
+        $price = $stall->getCalculatedPriceExpenses();
+
+        if ($price <= 0) {
+            return 0;
+        }
+
+        $subtotal = 0;
+
+        if ($stall->rate->rate_type == 'daily') {
+            $subtotal = $price * $days->count();
+        } else {
+            $subtotal = $price;
+        }
+
+        $this->addConceptToBatch([
+            'invoice_id' => $invoiceId,
+            'stall_id' => $stallId,
+            'concept' => 'expenses',
+            'concept_type' => $stall->rate->price_type,
+            'type_rate' => $stall->rate->rate_type,
+            'length' => $stall->length,
+            'qty_days' => $days->count(),
+            'price' => $stall->rate->price_expenses,
+            'subtotal' => $subtotal
+        ]);
+
+        return $subtotal;
+    }
+
+    /**
+     * Genera el concepte de bonificacions i retorna el subtotal
+     */
+    private function generateBonusesConceptOptimized($stall, $from, $to, $days, $invoiceId, $stallId): float
+    {
+        // Utilitzem el mètode existent del model per calcular
+        $bonusesPrice = $stall->generateBonusesConcept($from, $to, $days, $invoiceId, $stallId);
+        return $bonusesPrice;
+    }
+
+    /**
+     * Processa una persona i genera el seu invoice
+     * Retorna l'invoice creat o null si no s'ha creat/és buit
+     * NOTA: Utilitza la lògica ORIGINAL per obtenir stalls (més fiable)
      */
     private function processPersonInvoice(
-        $person,
-        $from,
-        $to,
-        $market_group_id,
-        $especialEdition,
-        $liquidationDays,
-        $years,
-        $request
-    ) {
-        // Comprovar si ja existeix invoice (excepte en edició especial)
+        Person $person,
+        string $from,
+        string $to,
+        int $marketGroupId,
+        bool $especialEdition,
+        ?int $liquidationDays,
+        string $years,
+        ?int $month,
+        ?int $trimestral
+    ): ?Invoice {
+        // Comprovar si ja existeix un invoice (LÒGICA ORIGINAL)
         if (!$especialEdition) {
             $invoiceQuery = Invoice::published()
                 ->where('person_id', $person->id)
-                ->where('market_group_id', $market_group_id)
+                ->where('market_group_id', $marketGroupId)
                 ->where('years', $years);
 
-            if (isset($request->trimestral)) {
-                $invoiceQuery->where('type', 'trimestral')->where('trimestral', $request->trimestral);
+            if (isset($trimestral)) {
+                $invoiceQuery->where('type', 'trimestral')->where('trimestral', $trimestral);
             } else {
-                $invoiceQuery->where('type', 'mensual')->where('month', $request->month);
+                $invoiceQuery->where('type', 'mensual')->where('month', $month);
             }
 
-            $invoice = $invoiceQuery->first();
-            if ($invoice) {
-                return null; // Ja existeix, no cal crear-ne un altre
+            $existingInvoice = $invoiceQuery->first();
+            if ($existingInvoice) {
+                return null;
             }
         }
 
         // Crear invoice
         $invoice = Invoice::create([
-            'status'          => 0,
-            'person_id'       => $person->id,
-            'market_group_id' => $market_group_id,
-            'type'            => isset($request->trimestral) ? 'trimestral' : 'mensual',
-            'month'           => isset($request->month) ? $request->month : null,
-            'trimestral'      => isset($request->trimestral) ? $request->trimestral : null,
-            'years'           => $years,
-            'total'           => 0,
-            'special_edition' => $especialEdition
+            'status' => 0,
+            'person_id' => $person->id,
+            'market_group_id' => $marketGroupId,
+            'type' => isset($trimestral) ? 'trimestral' : 'mensual',
+            'month' => $month ?? null,
+            'trimestral' => $trimestral ?? null,
+            'years' => $years,
+            'total' => 0,
+            'special_edition' => $especialEdition ? 1 : 0
         ]);
 
-        // Processar els stalls
+        $totalInvoice = 0;
+        $hasValidConcepts = false;
+
+        // LÒGICA ORIGINAL: Obtenir stalls amb query (NO eager loading)
         $stalls = $person->historicals()->where(function ($query) use ($from, $to) {
             $query->where('end_vigencia', null)
                 ->orWhere('end_vigencia', '>=', $from)
                 ->where('ends_at', null)
                 ->orWhere('ends_at', '>=', $from);
-        })->where('market_group_id', $market_group_id)->get();
+        })->where('market_group_id', $marketGroupId)->get();
 
         foreach ($stalls as $stall) {
-            // Validacions
+            // Validacions habituals (LÒGICA ORIGINAL)
             if ($stall->pivot->ends_at != null && $stall->pivot->ends_at <= $to) {
                 if ($stall->pivot->ends_at < $from || !($stall->pivot->ends_at >= $from && $stall->pivot->ends_at <= $to)) {
                     continue;
@@ -631,89 +771,122 @@ class InvoiceCrudController extends CrudController
             if ($stall->rate_id == null) {
                 continue;
             }
-            if (isset($request->trimestral) && !$stall->{'trimestral_' . $request->trimestral}) {
+            if (isset($trimestral) && !$stall->{'trimestral_' . $trimestral}) {
                 continue;
             }
 
-            if ($especialEdition) {
-                // Edició especial
-                $tarifa = $stall->getCalculatedPrice();
-                $stall_price = $tarifa * $liquidationDays;
+            // Obtenir dies del calendari (OPTIMITZAT: des del cache)
+            $days = $this->getCalendarDays($stall->market->id);
 
-                InvoiceConcept::create([
-                    'invoice_id'   => $invoice->id,
-                    'stall_id'     => $stall->id,
-                    'concept'      => 'stall',
-                    'concept_type' => $stall->rate->price_type,
-                    'type_rate'    => $stall->rate->rate_type,
-                    'length'       => $stall->length,
-                    'qty_days'     => $liquidationDays,
-                    'price'        => $tarifa,
-                    'subtotal'     => $stall_price,
-                ]);
-
-                $invoice->total += $stall_price;
-                $invoice->save();
-            } else {
-                // Càlcul normal
-                // *** Utilitzar cache de calendari ***
-                $days = $this->getCalendarDays($stall->market->id, $from, $to);
-
-                // Ajustar dies segons alta/baixa
-                $adjustedDays = clone $days;
-                if ($stall->pivot->ends_at != null && $stall->pivot->ends_at >= $from && $stall->pivot->ends_at <= $to) {
-                    $adjustedDays = $adjustedDays->reject(function ($day) use ($stall) {
-                        return $day->date >= $stall->pivot->ends_at;
-                    });
-                }
-                if ($stall->pivot->start_at != null && $stall->pivot->start_at >= $from && $stall->pivot->start_at <= $to) {
-                    $adjustedDays = $adjustedDays->reject(function ($day) use ($stall) {
-                        return $day->date <= $stall->pivot->start_at;
-                    });
-                }
-
-                // Generar conceptes
-                $stall_price   = $stall->generateStallConcept($adjustedDays, $invoice->id, $stall->id);
-                $expenses_price = $stall->generateExpensesConcept($adjustedDays, $invoice->id, $stall->id);
-                $bonuses_price  = $stall->generateBonusesConcept($from, $to, $adjustedDays, $invoice->id, $stall->id);
-
-                $invoice->total += ($stall_price + $expenses_price - $bonuses_price);
+            // Si no hi ha dies al cache, fer query (fallback)
+            if ($days->isEmpty()) {
+                $days = Calendar::filterByMarket($stall->market->id)
+                    ->filterByDateRange($from, $to)
+                    ->get();
             }
-            $invoice->save();
+
+            // Ajustar dies segons dates del stall (LÒGICA ORIGINAL)
+            if ($stall->pivot->ends_at != null && $stall->pivot->ends_at >= $from && $stall->pivot->ends_at <= $to) {
+                $days = $days->filter(function ($day) use ($stall) {
+                    return $day->date < $stall->pivot->ends_at;
+                });
+            }
+            if ($stall->pivot->start_at != null && $stall->pivot->start_at >= $from && $stall->pivot->start_at <= $to) {
+                $days = $days->filter(function ($day) use ($stall) {
+                    return $day->date > $stall->pivot->start_at;
+                });
+            }
+
+            if ($days->isEmpty()) {
+                continue;
+            }
+
+            // Generar conceptes (LÒGICA ORIGINAL: utilitzant mètodes del model)
+            $stall_price = $stall->generateStallConcept($days, $invoice->id, $stall->id);
+            $expenses_price = $stall->generateExpensesConcept($days, $invoice->id, $stall->id);
+            $bonuses_price = $stall->generateBonusesConcept($from, $to, $days, $invoice->id, $stall->id);
+
+            $totalInvoice += ($stall_price + $expenses_price - $bonuses_price);
+            $hasValidConcepts = true;
         }
 
-        // Eliminar si no té conceptes o total és 0
+        // Guardar total
+        $invoice->total = $totalInvoice;
+        $invoice->save();
+
+        // Si no s'han generat conceptes o el total és 0, marcar per eliminar
         if ($invoice->concepts->count() == 0 || $invoice->total == 0) {
-            $invoice->delete();
-            $this->refreshDB();
+            $this->invoicesToDelete[] = $invoice->id;
             return null;
         }
-
-        // Netejar variables
-        unset($stalls, $days, $adjustedDays);
 
         return $invoice;
     }
 
     /**
-     * *** Cache de dies del calendari ***
-     * 
-     * Emmagatzema els dies del calendari en memòria per evitar
-     * consultes repetides a la base de dades per al mateix mercat
+     * Filtra els dies del calendari segons les dates del stall
      */
-    private function getCalendarDays($marketId, $from, $to)
-    {
-        $cacheKey = "{$marketId}_{$from}_{$to}";
+    private function filterCalendarDays(
+        \Illuminate\Support\Collection $days,
+        ?string $stallStartAt,
+        ?string $stallEndsAt,
+        string $from,
+        string $to
+    ): \Illuminate\Support\Collection {
+        return $days->filter(function ($day) use ($stallStartAt, $stallEndsAt, $from, $to) {
+            $date = $day->date;
 
-        if (!isset($this->calendarCache[$cacheKey])) {
-            $this->calendarCache[$cacheKey] = Calendar::filterByMarket($marketId)
-                ->filterByDateRange($from, $to)
-                ->get();
-        }
+            // Filtrar per data d'inici del stall
+            if ($stallStartAt && $stallStartAt >= $from && $stallStartAt <= $to) {
+                if ($date <= $stallStartAt) {
+                    return false;
+                }
+            }
 
-        return $this->calendarCache[$cacheKey];
+            // Filtrar per data de fi del stall
+            if ($stallEndsAt && $stallEndsAt >= $from && $stallEndsAt <= $to) {
+                if ($date >= $stallEndsAt) {
+                    return false;
+                }
+            }
+
+            return true;
+        })->values();
     }
 
+    /**
+     * Pre-carrega tots els dies del calendari per als mercats del grup
+     * OPTIMITZACIÓ: Una única query en lloc de N queries (una per stall)
+     */
+    private function preloadCalendar(int $marketGroupId, string $from, string $to): void
+    {
+        // Obtenir tots els market IDs actius del grup
+        $marketIds = Market::where('market_group_id', $marketGroupId)
+            ->where('status', 1)
+            ->pluck('id')
+            ->toArray();
+
+        if (empty($marketIds)) {
+            return;
+        }
+
+        // Carregar TOTS els dies del calendari d'UNA vegada
+        $allDays = Calendar::whereIn('market_id', $marketIds)
+            ->whereBetween('date', [$from, $to])
+            ->orderBy('date')
+            ->get();
+
+        // Agrupar per market_id per accés ràpid
+        $this->calendarCache = $allDays->groupBy('market_id');
+    }
+
+    /**
+     * Obté els dies del calendari per un mercat (des del cache)
+     */
+    private function getCalendarDays(int $marketId): \Illuminate\Support\Collection
+    {
+        return $this->calendarCache[$marketId] ?? collect();
+    }
 
     public function generate_gtt(Request $request)
     {
@@ -1152,19 +1325,11 @@ class InvoiceCrudController extends CrudController
 
         $entries = request()->input('entries', []);
         $deletedEntries = [];
-        $elementNotDelete = false;
 
-        foreach ($entries as $key => $id) {
+        foreach ($entries as $id) {
             if ($entry = $this->crud->model->find($id)) {
                 $deletedEntries[] = $entry->delete();
             }
-        }
-
-        if ($elementNotDelete) {
-            return response([
-                'title' => __('timeclock::calendar.delete.error.title'),
-                'message' => __('timeclock::calendar.delete.error.message')
-            ], '403');
         }
 
         return $deletedEntries;
@@ -1185,25 +1350,32 @@ class InvoiceCrudController extends CrudController
         return Excel::download(new InvoicesExport($invoices), 'provisional-' . $code . '.xlsx');
     }
 
+    /**
+     * Elimina invoices provisionals de forma optimitzada
+     */
+    public function deleteExpiredOptimized(): void
+    {
+        // Obtenir IDs d'invoices amb status 0
+        $invoiceIds = Invoice::where('status', 0)->pluck('id')->toArray();
+
+        if (!empty($invoiceIds)) {
+            // Eliminar concepts primer (FK constraint)
+            InvoiceConcept::whereIn('invoice_id', $invoiceIds)->delete();
+            // Eliminar invoices
+            Invoice::whereIn('id', $invoiceIds)->delete();
+        }
+    }
+
     public function deleteExpired()
     {
-        //Obtenemos los invoices status 0 y los eliminamos (utilizamos foreach, para que asi funcione el observer)
-        $invoices = Invoice::where('status', 0)->get();
-        foreach ($invoices as $invoice) {
-            $invoice->delete();
-        }
-
-        //Refrescamos la id de la tabla invoices
+        $this->deleteExpiredOptimized();
         $this->refreshDB();
     }
 
     public function refreshDB()
     {
-        $max = DB::table('invoices')->max('id');
-        do {
-            $max++;
-        } while (Invoice::find($max) != NULL);
-
-        DB::statement("ALTER TABLE invoices AUTO_INCREMENT =  $max");
+        $max = DB::table('invoices')->max('id') ?? 0;
+        $max++;
+        DB::statement("ALTER TABLE invoices AUTO_INCREMENT = $max");
     }
 }
