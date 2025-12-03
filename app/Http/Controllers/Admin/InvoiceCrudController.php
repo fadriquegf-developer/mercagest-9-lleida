@@ -40,6 +40,9 @@ class InvoiceCrudController extends CrudController
     }
     use \App\Traits\AdminPermissions;
 
+    // *** Cache per als dies del calendari ***
+    private $calendarCache = [];
+
     /**
      * Configure the CrudPanel object. Apply settings to all operations.
      *
@@ -419,9 +422,18 @@ class InvoiceCrudController extends CrudController
         return view('admin.invoice.generate_invoices', $this->data);
     }
 
+    /**
+     * *** OPTIMITZAT ***
+     * 
+     * Genera invoices de forma optimitzada utilitzant:
+     * - Chunking per processar en grups petits
+     * - Eager loading per evitar N+1
+     * - Cache de calendari
+     * - Gestió de memòria millorada
+     */
     public function generate_index_invoice(Request $request)
     {
-        // Si se marca edición especial, liquidación de días debe estar presente y ser mayor que 0
+        // Validació
         if ($request->especial_edition) {
             $validator = Validator::make($request->all(), [
                 'liquidation_days' => 'required|integer|min:1',
@@ -440,15 +452,13 @@ class InvoiceCrudController extends CrudController
 
         $years = $request->years;
         $market_group_id = $request->marketgroup_id;
-
-        // Detectamos si se ha marcado la edición especial y, en ese caso, obtenemos el número de días a liquidar
         $especialEdition = $request->especial_edition ?? 0;
         $liquidationDays = $especialEdition ? $request->liquidation_days : null;
 
-        // Eliminamos los invoices provisionales (status 0) de la misma forma que ya lo haces
+        // Eliminem invoices provisionals
         $this->deleteExpired();
 
-        // Comprobamos si se ha seleccionado un trimestre o un mes, para determinar el rango de fechas
+        // Determinem el rang de dates
         if ($request->trimestral) {
             $trimestral = $request->trimestral;
             switch ($trimestral) {
@@ -475,8 +485,12 @@ class InvoiceCrudController extends CrudController
             $to = \Carbon\Carbon::create($years, $month)->lastOfMonth()->toDateString();
         }
 
-        // Obtenemos las personas que tengan parades activas con el marketgroup seleccionado
-        $persons = Person::whereHas('historicals', function ($query) use ($market_group_id, $from, $to) {
+        $invoices = [];
+        $chunkSize = 50; // *** Processar en chunks de 50 ***
+        $processedCount = 0;
+
+        // *** Eager Loading per evitar N+1 ***
+        Person::whereHas('historicals', function ($query) use ($market_group_id, $from, $to) {
             $query->activeTitular()
                 ->orWhere(function ($query) use ($from, $to) {
                     $query->whereDate('ends_at', '>=', $from)
@@ -486,139 +500,218 @@ class InvoiceCrudController extends CrudController
                 ->whereHas('market', function ($market) {
                     $market->where('status', 1);
                 });
-        })->orderBy('name', 'ASC')->get();
-
-        $invoices = [];
-
-        foreach ($persons as $person) {
-
-            // Si no es edición especial, comprobamos si ya existe un invoice con esas características.
-            // En edición especial se ignora esta comprobación para generar nuevos invoices aunque ya exista uno.
-            if (!$especialEdition) {
-                $invoiceQuery = Invoice::published()
-                    ->where('person_id', $person->id)
-                    ->where('market_group_id', $market_group_id)
-                    ->where('years', $years);
-                if (isset($trimestral)) {
-                    $invoiceQuery->where('type', 'trimestral')->where('trimestral', $trimestral);
-                } else {
-                    $invoiceQuery->where('type', 'mensual')->where('month', $month);
+        })
+            ->with([
+                'historicals' => function ($query) use ($from, $to, $market_group_id) {
+                    $query->where(function ($q) use ($from, $to) {
+                        $q->where('end_vigencia', null)
+                            ->orWhere('end_vigencia', '>=', $from);
+                    })
+                        ->where('market_group_id', $market_group_id);
+                },
+                'historicals.market',
+                'historicals.rate',
+                'historicals.classe',
+                'historicals.bonuses' => function ($query) use ($from, $to) {
+                    $query->filterByDateRange($from, $to);
                 }
-                $invoice = $invoiceQuery->first();
-            } else {
-                $invoice = null; // siempre se creará uno nuevo en edición especial
-            }
+            ])
+            ->orderBy('name', 'ASC')
+            ->chunk($chunkSize, function ($persons) use (
+                $from,
+                $to,
+                $market_group_id,
+                $especialEdition,
+                $liquidationDays,
+                $years,
+                &$invoices,
+                &$processedCount,
+                $request
+            ) {
+                foreach ($persons as $person) {
+                    // *** Mètode separat per processar cada persona ***
+                    $invoice = $this->processPersonInvoice(
+                        $person,
+                        $from,
+                        $to,
+                        $market_group_id,
+                        $especialEdition,
+                        $liquidationDays,
+                        $years,
+                        $request
+                    );
 
-            if (!$invoice || $especialEdition) {
-
-                // Creamos el invoice
-                $invoice = Invoice::create([
-                    'status'          => 0,
-                    'person_id'       => $person->id,
-                    'market_group_id' => $market_group_id,
-                    'type'            => isset($trimestral) ? 'trimestral' : 'mensual',
-                    'month'           => isset($month) ? $month : null,
-                    'trimestral'      => isset($trimestral) ? $trimestral : null,
-                    'years'           => $years,
-                    'total'           => 0,
-                    'special_edition' => $especialEdition
-                ]);
-
-                // Obtenemos los puestos (stalls) asociados a la persona y filtramos por market_group
-                $stalls = $person->historicals()->where(function ($query) use ($from, $to) {
-                    $query->where('end_vigencia', null)
-                        ->orWhere('end_vigencia', '>=', $from)
-                        ->where('ends_at', null)
-                        ->orWhere('ends_at', '>=', $from);
-                })->where('market_group_id', $market_group_id)->get();
-
-                foreach ($stalls as $stall) {
-
-                    // Validaciones habituales:
-                    if ($stall->pivot->ends_at != null && $stall->pivot->ends_at <= $to) {
-                        if ($stall->pivot->ends_at < $from || !($stall->pivot->ends_at >= $from && $stall->pivot->ends_at <= $to)) {
-                            continue;
-                        }
-                    }
-                    if ($stall->market->status == 0) {
-                        continue;
-                    }
-                    if ($stall->rate_id == null) {
-                        continue;
-                    }
-                    if (isset($trimestral) && !$stall->{'trimestral_' . $trimestral}) {
-                        continue;
+                    if ($invoice) {
+                        $invoices[] = $invoice;
                     }
 
-                    if ($especialEdition) {
-                        // ******** Cálculo en modo "Edició especial" ********
-                        // Obtenemos la tarifa asignada actualmente usando getCalculatedPrice()
-                        $tarifa = $stall->getCalculatedPrice();
-                        // Multiplicamos por el número de días indicado
-                        $stall_price = $tarifa * $liquidationDays;
+                    $processedCount++;
 
-                        // (Opcional) Creamos un concepto de invoice para reflejar este cálculo especial
-                        InvoiceConcept::create([
-                            'invoice_id'   => $invoice->id,
-                            'stall_id'     => $stall->id,
-                            'concept'      => 'stall',
-                            'concept_type' => $stall->rate->price_type,
-                            'type_rate'    => $stall->rate->rate_type,
-                            'length'       => $stall->length,
-                            'qty_days'     => $liquidationDays,
-                            'price'        => $tarifa,
-                            'subtotal'     => $stall_price,
-                        ]);
-
-                        // Sumamos el importe al total del invoice
-                        $invoice->total += $stall_price;
-                        $invoice->save();
-                    } else {
-                        // ***** Cálculo normal *****
-                        // Se obtienen els dies del calendari per al mercat del puesto
-                        $days = Calendar::filterByMarket($stall->market->id)
-                            ->filterByDateRange($from, $to)
-                            ->get();
-
-                        // Ajustamos los días si se ha dado de baixa o d’alta en medio del període
-                        if ($stall->pivot->ends_at != null && $stall->pivot->ends_at >= $from && $stall->pivot->ends_at <= $to) {
-                            foreach ($days as $key => $day) {
-                                if ($day->date >= $stall->pivot->ends_at) {
-                                    $days->forget($key);
-                                }
-                            }
-                        }
-                        if ($stall->pivot->start_at != null && $stall->pivot->start_at >= $from && $stall->pivot->start_at <= $to) {
-                            foreach ($days as $key => $day) {
-                                if ($day->date <= $stall->pivot->start_at) {
-                                    $days->forget($key);
-                                }
-                            }
-                        }
-
-                        // Se calculan los conceptos habituales:
-                        $stall_price   = $stall->generateStallConcept($days, $invoice->id, $stall->id);
-                        $expenses_price = $stall->generateExpensesConcept($days, $invoice->id, $stall->id);
-                        $bonuses_price  = $stall->generateBonusesConcept($from, $to, $days, $invoice->id, $stall->id);
-
-                        $invoice->total += ($stall_price + $expenses_price - $bonuses_price);
+                    // Forçar garbage collection cada 20 persones
+                    if ($processedCount % 20 === 0) {
+                        gc_collect_cycles();
                     }
-                    $invoice->save();
                 }
+            });
 
-                // Si no se han generado conceptos o el total es 0, se elimina el invoice (tal como en la lógica actual)
-                if ($invoice->concepts->count() == 0 || $invoice->total == 0) {
-                    $invoice->delete();
-                    $this->refreshDB();
-                } else {
-                    // Se añade a la lista para mostrar solo los invoices generados en este proceso
-                    array_push($invoices, $invoice);
-                }
-            }
-        }
+        // Netegem el cache al final
+        $this->calendarCache = [];
+        gc_collect_cycles();
 
         $crud = $this->crud;
         return view('admin.invoice.index_invoice_gtt', compact('invoices', 'crud'));
+    }
+
+    /**
+     * *** Mètode privat per processar cada persona ***
+     * 
+     * Extreu la lògica de generació d'invoices a un mètode separat
+     * per facilitar la gestió de memòria i el manteniment del codi
+     */
+    private function processPersonInvoice(
+        $person,
+        $from,
+        $to,
+        $market_group_id,
+        $especialEdition,
+        $liquidationDays,
+        $years,
+        $request
+    ) {
+        // Comprovar si ja existeix invoice (excepte en edició especial)
+        if (!$especialEdition) {
+            $invoiceQuery = Invoice::published()
+                ->where('person_id', $person->id)
+                ->where('market_group_id', $market_group_id)
+                ->where('years', $years);
+
+            if (isset($request->trimestral)) {
+                $invoiceQuery->where('type', 'trimestral')->where('trimestral', $request->trimestral);
+            } else {
+                $invoiceQuery->where('type', 'mensual')->where('month', $request->month);
+            }
+
+            $invoice = $invoiceQuery->first();
+            if ($invoice) {
+                return null; // Ja existeix, no cal crear-ne un altre
+            }
+        }
+
+        // Crear invoice
+        $invoice = Invoice::create([
+            'status'          => 0,
+            'person_id'       => $person->id,
+            'market_group_id' => $market_group_id,
+            'type'            => isset($request->trimestral) ? 'trimestral' : 'mensual',
+            'month'           => isset($request->month) ? $request->month : null,
+            'trimestral'      => isset($request->trimestral) ? $request->trimestral : null,
+            'years'           => $years,
+            'total'           => 0,
+            'special_edition' => $especialEdition
+        ]);
+
+        // Processar els stalls
+        $stalls = $person->historicals()->where(function ($query) use ($from, $to) {
+            $query->where('end_vigencia', null)
+                ->orWhere('end_vigencia', '>=', $from)
+                ->where('ends_at', null)
+                ->orWhere('ends_at', '>=', $from);
+        })->where('market_group_id', $market_group_id)->get();
+
+        foreach ($stalls as $stall) {
+            // Validacions
+            if ($stall->pivot->ends_at != null && $stall->pivot->ends_at <= $to) {
+                if ($stall->pivot->ends_at < $from || !($stall->pivot->ends_at >= $from && $stall->pivot->ends_at <= $to)) {
+                    continue;
+                }
+            }
+            if ($stall->market->status == 0) {
+                continue;
+            }
+            if ($stall->rate_id == null) {
+                continue;
+            }
+            if (isset($request->trimestral) && !$stall->{'trimestral_' . $request->trimestral}) {
+                continue;
+            }
+
+            if ($especialEdition) {
+                // Edició especial
+                $tarifa = $stall->getCalculatedPrice();
+                $stall_price = $tarifa * $liquidationDays;
+
+                InvoiceConcept::create([
+                    'invoice_id'   => $invoice->id,
+                    'stall_id'     => $stall->id,
+                    'concept'      => 'stall',
+                    'concept_type' => $stall->rate->price_type,
+                    'type_rate'    => $stall->rate->rate_type,
+                    'length'       => $stall->length,
+                    'qty_days'     => $liquidationDays,
+                    'price'        => $tarifa,
+                    'subtotal'     => $stall_price,
+                ]);
+
+                $invoice->total += $stall_price;
+                $invoice->save();
+            } else {
+                // Càlcul normal
+                // *** Utilitzar cache de calendari ***
+                $days = $this->getCalendarDays($stall->market->id, $from, $to);
+
+                // Ajustar dies segons alta/baixa
+                $adjustedDays = clone $days;
+                if ($stall->pivot->ends_at != null && $stall->pivot->ends_at >= $from && $stall->pivot->ends_at <= $to) {
+                    $adjustedDays = $adjustedDays->reject(function ($day) use ($stall) {
+                        return $day->date >= $stall->pivot->ends_at;
+                    });
+                }
+                if ($stall->pivot->start_at != null && $stall->pivot->start_at >= $from && $stall->pivot->start_at <= $to) {
+                    $adjustedDays = $adjustedDays->reject(function ($day) use ($stall) {
+                        return $day->date <= $stall->pivot->start_at;
+                    });
+                }
+
+                // Generar conceptes
+                $stall_price   = $stall->generateStallConcept($adjustedDays, $invoice->id, $stall->id);
+                $expenses_price = $stall->generateExpensesConcept($adjustedDays, $invoice->id, $stall->id);
+                $bonuses_price  = $stall->generateBonusesConcept($from, $to, $adjustedDays, $invoice->id, $stall->id);
+
+                $invoice->total += ($stall_price + $expenses_price - $bonuses_price);
+            }
+            $invoice->save();
+        }
+
+        // Eliminar si no té conceptes o total és 0
+        if ($invoice->concepts->count() == 0 || $invoice->total == 0) {
+            $invoice->delete();
+            $this->refreshDB();
+            return null;
+        }
+
+        // Netejar variables
+        unset($stalls, $days, $adjustedDays);
+
+        return $invoice;
+    }
+
+    /**
+     * *** Cache de dies del calendari ***
+     * 
+     * Emmagatzema els dies del calendari en memòria per evitar
+     * consultes repetides a la base de dades per al mateix mercat
+     */
+    private function getCalendarDays($marketId, $from, $to)
+    {
+        $cacheKey = "{$marketId}_{$from}_{$to}";
+
+        if (!isset($this->calendarCache[$cacheKey])) {
+            $this->calendarCache[$cacheKey] = Calendar::filterByMarket($marketId)
+                ->filterByDateRange($from, $to)
+                ->get();
+        }
+
+        return $this->calendarCache[$cacheKey];
     }
 
 

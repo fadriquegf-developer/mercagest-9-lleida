@@ -158,31 +158,81 @@ class Stall extends Model
 
     public function generateBonusesConcept($from, $to, $days, $invoice, $stall)
     {
+        // Obtenim totes les bonificacions del període
+        $bonuses = $this->bonuses()->filterByDateRange($from, $to)->get();
 
-        $price_without_discount = $this->getPriceByDateRangeWithoutDiscount($from, $to, $days);
-
-        $price_with_discount = $this->getPriceByDateRangeWithDiscount($from, $to, $days);
-
-        $subtotal = $price_without_discount - $price_with_discount;
-
-        //Creamos solo si hay bonuses
-        if ($subtotal != 0) {
-            InvoiceConcept::create([
-                'invoice_id' => $invoice,
-                'stall_id' => $stall,
-                'length' => $this->length,
-                'qty_days' => $days->count(),
-                'concept' => 'bonuses',
-                'concept_type' => 'fixed',
-                'type_rate' => $this->rate->rate_type,
-                'title' => isset($this->bonuses()->filterByDateRange($from, $to)->first()->title) ? $this->bonuses()->filterByDateRange($from, $to)->first()->title : NULL,
-                'price' => $subtotal,
-                'subtotal' => $subtotal
-            ]);
+        if ($bonuses->count() === 0) {
+            return 0;
         }
 
-        //Devolvemos el subtotal que debe restarse al total del invoice
-        return $subtotal;
+        // Preu sense descompte
+        $price_without_discount = $this->getPriceByDateRangeWithoutDiscount($from, $to, $days);
+
+        $total_discount = 0;
+        $remaining_price = $price_without_discount;
+
+        // Creem una línia per cada bonificació
+        foreach ($bonuses as $bonus) {
+            // Calculem el descompte d'aquesta bonificació sobre el preu restant
+            $bonus_discount = $this->calculateBonusDiscount($bonus, $remaining_price, $days->count());
+
+            if ($bonus_discount > 0) {
+                // Creem la línia de concepte per aquesta bonificació
+                InvoiceConcept::create([
+                    'invoice_id' => $invoice,
+                    'stall_id' => $stall,
+                    'length' => $this->length,
+                    'qty_days' => $days->count(),
+                    'concept' => 'bonuses',
+                    'concept_type' => 'fixed',
+                    'type_rate' => $this->rate->rate_type,
+                    'title' => $bonus->title ?? 'Bonificació',
+                    'price' => $bonus_discount,
+                    'subtotal' => $bonus_discount
+                ]);
+
+                $total_discount += $bonus_discount;
+                $remaining_price -= $bonus_discount;
+
+                // No pot quedar un preu negatiu
+                if ($remaining_price < 0) {
+                    $remaining_price = 0;
+                }
+            }
+        }
+
+        return $total_discount;
+    }
+
+    // Nou mètode auxiliar per calcular el descompte d'una bonificació
+    private function calculateBonusDiscount($bonus, $remaining_price, $market_days)
+    {
+        $discount = 0;
+
+        switch ($bonus->type) {
+            case 'discount': // Import fix
+                $discount = min($bonus->amount, $remaining_price);
+                break;
+
+            case 'percentage': // Percentatge
+                $discount = round($remaining_price * $bonus->amount / 100, 2);
+                break;
+
+            case 'days': // Número de dies a bonificar
+                if ($this->rate->rate_type == 'daily') {
+                    // Preu per dia
+                    $price_per_day = $remaining_price / $market_days;
+                    // 75% del preu dels dies bonificats
+                    $discount = round($price_per_day * $bonus->amount * 0.75, 2);
+                } else {
+                    // Tarifa fixa: calculem proporció sobre el total
+                    $discount = round(($remaining_price / $market_days) * $bonus->amount * 0.75, 2);
+                }
+                break;
+        }
+
+        // Assegurem que no supera el preu restant
+        return min($discount, $remaining_price);
     }
 
     public function getPriceByDateRangeWithoutDiscount($from, $to, $days)
@@ -599,7 +649,7 @@ class Stall extends Model
 
     public function getIdNumAttribute()
     {
-       return $this->num . ' (#' . $this->id . ')';
+        return $this->num . ' (#' . $this->id . ')';
     }
 
     public function getNumMarketActiveTitularAttribute()
